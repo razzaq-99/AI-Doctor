@@ -1,7 +1,9 @@
 from langchain_core.prompts import PromptTemplate
 from langchain_ollama import ChatOllama , OllamaEmbeddings
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
-from langchain_hubbingface import HuggingFaceEndpoint
+from langchain_huggingface import HuggingFaceEndpoint
+from langchain.chains import RetrievalQA
+from langchain_community.vectorstores import FAISS
 import os
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -31,3 +33,34 @@ Question : {question}
 
 Start the answer directly, No small talks please.
 """
+
+
+def set_prompt(prompt_template):
+    prompt = PromptTemplate(
+        template=prompt_template,
+        input_variables=["context", "question"]
+    )
+    return prompt
+
+
+embeddings = HuggingFaceEmbeddings(model_name = "sentence-transformers/all-MiniLM-L6-v2")
+db = FAISS.load_local(db_path, embeddings, allow_dangerous_deserialization=True)
+
+prompt = set_prompt(prompt_template)
+
+qa_chain = RetrievalQA.from_chain_type(
+    llm = load_llm(huggingface_repo_id),
+    chain_type = "stuff",
+    retriever = db.as_retriever(search_kwargs = {"k": 3}),
+    return_source_documents = True ,
+    chain_type_kwargs = {
+        'prompt': prompt
+    }
+)
+
+
+user_query = input("Enter your question: ")
+response = qa_chain.invoke({"query": user_query})
+
+print("RESULT : ", response['result'])
+print("SOURCE DOCUMENTS : ", response['source_documents'])
