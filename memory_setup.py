@@ -1,6 +1,9 @@
 from langchain_community.document_loaders import PyPDFLoader , DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
+from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+
 
 load_dotenv()
 
@@ -12,7 +15,7 @@ def load_pdf(data):
     documents = loader.load()
     return documents
 documents = load_pdf(data_path)
-print("length : ", len(documents))
+
 
 
 
@@ -22,4 +25,16 @@ def create_chunks(extracted_data):
     return chunks
 
 text_chunks = create_chunks(documents)
-print('length :', len(text_chunks))
+
+
+
+def get_embedding_model():
+    model = HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2')
+    return model
+
+embedding_model = get_embedding_model()
+
+
+db_path = 'vectorstore/db_faiss'
+db = FAISS.from_documents(text_chunks, embedding_model)
+db.save_local(db_path)
