@@ -9,6 +9,8 @@ load_dotenv()
 
 data_path = "data/"
 
+
+# ---------------- Load PDF ----------------
 def load_pdf(data):
     loader = DirectoryLoader(data, glob = '*.pdf', loader_cls=PyPDFLoader)
     
@@ -18,7 +20,7 @@ documents = load_pdf(data_path)
 
 
 
-
+# ---------------- Create Chunk ----------------
 def create_chunks(extracted_data):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     chunks = text_splitter.split_documents(extracted_data)
@@ -28,6 +30,7 @@ text_chunks = create_chunks(documents)
 
 
 
+# ---------------- Embedding model ----------------
 def get_embedding_model():
     model = HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2')
     return model
@@ -35,6 +38,8 @@ def get_embedding_model():
 embedding_model = get_embedding_model()
 
 
+
+# ---------------- Storing data ----------------
 db_path = 'vectorstore/db_faiss'
 db = FAISS.from_documents(text_chunks, embedding_model)
 db.save_local(db_path)
