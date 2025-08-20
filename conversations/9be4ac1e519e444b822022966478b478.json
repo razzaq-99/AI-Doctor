@@ -1,0 +1,15 @@
+{
+  "id": "9be4ac1e519e444b822022966478b478",
+  "title": "New chat",
+  "created_at": "2025-08-20T11:36:08.485358",
+  "messages": [
+    {
+      "role": "user",
+      "content": "How to cure cancer"
+    },
+    {
+      "role": "assistant",
+      "content": "The context does not provide information on how to cure cancer, so I cannot answer this question from the context."
+    }
+  ]
+}
