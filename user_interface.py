@@ -23,10 +23,11 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 CONV_DIR = Path("conversations")
 LAST_CONV_FILE = CONV_DIR / "last_conv.json"
+INDEX_FILE = CONV_DIR / "index.json"
 CONV_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------- Loading data from vectorstore ----------------
+# ---------------- Loading data from vectorstore (cached) ----------------
 @st.cache_resource
 def get_vectorstore():
     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL_NAME)
@@ -45,44 +46,109 @@ def get_llm():
         model=OLLAMA_MODEL,
         base_url=OLLAMA_BASE_URL,
         temperature=0.3,
-        num_predict=512
+        num_predict=512,
     )
 
 
-# ---------------- Conversation persistence helpers ----------------
+# ---------------- Conversation persistence helpers (with index + cache) ----------------
 def _conv_path(conv_id: str) -> Path:
     return CONV_DIR / f"{conv_id}.json"
 
 
-def list_conversations():
-    convs = []
-    for p in CONV_DIR.glob("*.json"):
-        if p.name == LAST_CONV_FILE.name:
-            continue
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            convs.append(data)
-        except Exception:
-            continue
+def _index_path() -> Path:
+    return INDEX_FILE
+
+
+def load_index():
+    """Load a lightweight index of conversations (id, title, created_at, preview).
+    This avoids reading every full conversation file on each rerun and improves sidebar performance.
+    """
+    p = _index_path()
+    if not p.exists():
+        return []
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) or []
+    except Exception:
+        return []
+
+
+def save_index(index: list):
+    try:
+        _index_path().write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def update_index_on_save(conv: dict):
+    index = load_index()
+    preview = ""
+    try:
+        if conv.get("messages"):
+            last = conv["messages"][-1]
+            preview = (last.get("content") or "")[:200]
+    except Exception:
+        preview = ""
+
+    entry = {
+        "id": conv["id"],
+        "title": conv.get("title", "Untitled"),
+        "created_at": conv.get("created_at", ""),
+        "preview": preview,
+    }
+
+    found = False
+    for i, e in enumerate(index):
+        if e.get("id") == conv["id"]:
+            index[i] = entry
+            found = True
+            break
+    if not found:
+        index.append(entry)
+
     
-    convs.sort(key=lambda c: c.get("created_at", ""), reverse=True)
-    return convs
+    index.sort(key=lambda c: c.get("created_at", ""), reverse=True)
+    save_index(index)
+
+
+def remove_from_index(conv_id: str):
+    index = load_index()
+    index = [e for e in index if e.get("id") != conv_id]
+    save_index(index)
+
+
 
 
 def save_conversation(conv: dict):
     path = _conv_path(conv["id"])
     path.write_text(json.dumps(conv, ensure_ascii=False, indent=2), encoding="utf-8")
-    LAST_CONV_FILE.write_text(json.dumps({"last": conv["id"]}), encoding="utf-8")
+    try:
+        LAST_CONV_FILE.write_text(json.dumps({"last": conv["id"]}), encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        update_index_on_save(conv)
+    except Exception:
+        pass
 
 
 def load_conversation(conv_id: str):
+    """Load a full conversation. Uses session_state cache to avoid repeated disk reads.
+    """
+    if "conv_cache" in st.session_state and conv_id in st.session_state["conv_cache"]:
+        return st.session_state["conv_cache"][conv_id]
+
     path = _conv_path(conv_id)
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        conv = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+    if "conv_cache" not in st.session_state:
+        st.session_state["conv_cache"] = {}
+    st.session_state["conv_cache"][conv_id] = conv
+    return conv
 
 
 def create_conversation(title: str = None):
@@ -93,16 +159,27 @@ def create_conversation(title: str = None):
         "id": conv_id,
         "title": title,
         "created_at": now,
-        "messages": []
+        "messages": [],
     }
     save_conversation(conv)
+    
+    st.session_state["convs_index"] = load_index()
     return conv
 
 
 def delete_conversation(conv_id: str):
     p = _conv_path(conv_id)
     if p.exists():
-        p.unlink()
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+    try:
+        remove_from_index(conv_id)
+    except Exception:
+        pass
+    
     if LAST_CONV_FILE.exists():
         try:
             last = json.loads(LAST_CONV_FILE.read_text(encoding="utf-8"))
@@ -110,6 +187,10 @@ def delete_conversation(conv_id: str):
                 LAST_CONV_FILE.unlink()
         except Exception:
             pass
+    
+    if "conv_cache" in st.session_state and conv_id in st.session_state["conv_cache"]:
+        del st.session_state["conv_cache"][conv_id]
+    st.session_state["convs_index"] = load_index()
 
 
 def rename_conversation(conv_id: str, new_title: str):
@@ -118,6 +199,10 @@ def rename_conversation(conv_id: str, new_title: str):
         return None
     conv["title"] = new_title
     save_conversation(conv)
+    
+    st.session_state["convs_index"] = load_index()
+    if "conv_cache" in st.session_state and conv_id in st.session_state["conv_cache"]:
+        st.session_state["conv_cache"][conv_id] = conv
     return conv
 
 
@@ -132,29 +217,7 @@ def get_last_conversation_id():
 
 
 # ---------------- Main method ----------------
-def safe_rerun():
-    """
-    Robust rerun helper that works across Streamlit versions.
-    Tries the public API first, then falls back to raising Streamlit's internal RerunException,
-    and finally toggles a session-state flag and stops the script as a last-resort.
-    """
-    try:
-        if hasattr(st, "experimental_rerun"):
-            safe_rerun()
-            return
-    except Exception:
-        pass
-
-    try:
-        from streamlit.runtime.scriptrunner.script_runner import RerunException
-        raise RerunException("user-requested-rerun")
-    except Exception:
-        st.session_state["_rerun_toggle"] = not st.session_state.get("_rerun_toggle", False)
-        st.stop()
-
-
 def main():
-
     st.set_page_config(page_title="AI Doctor", layout="wide")
 
     # ---------------- Some custom CSS ----------------
@@ -162,8 +225,7 @@ def main():
         """
         <style>
         /* Sidebar card & buttons */
-        .css-1d391kg {padding-top:0px;} /* small tweak for newer Streamlit versions */
-        [data-testid="stSidebar"] div[role="list"] {padding: 8px 8px 16px 8px}
+        [data-testid="stSidebar"] nav {padding: 8px 8px 16px 8px}
         .sidebar-header {font-size:18px; font-weight:700; color: #ffffff; padding: 12px 8px; text-align:center}
         .new-chat {background-color:#2b2d31; color:#e6edf3; padding:8px 10px; border-radius:8px; margin:6px 4px; display:block; text-align:left}
         .conv-item {background-color:#2b2d31; color:#dfe6ee; padding:8px; border-radius:8px; margin:6px 4px; display:flex; align-items:center; justify-content:space-between}
@@ -178,6 +240,16 @@ def main():
         unsafe_allow_html=True,
     )
 
+    
+    if "conv_cache" not in st.session_state:
+        st.session_state["conv_cache"] = {}
+    if "convs_index" not in st.session_state:
+        st.session_state["convs_index"] = load_index()
+    if "menu_conv_id" not in st.session_state:
+        st.session_state["menu_conv_id"] = None
+    if "menu_open" not in st.session_state:
+        st.session_state["menu_open"] = False
+
     # ---------------- Sidebar ----------------
     with st.sidebar:
         st.markdown('<div class="sidebar-header">AI Doctor</div>', unsafe_allow_html=True)
@@ -187,62 +259,58 @@ def main():
             st.session_state.current_conv_id = new_conv["id"]
             st.session_state.conversation_title = new_conv["title"]
             st.session_state.messages = new_conv["messages"]
-            safe_rerun()
 
         st.markdown("---")
 
-        convs = list_conversations()
+        convs = st.session_state.get("convs_index", [])
         if convs:
-            if "menu_conv_id" not in st.session_state:
-                st.session_state["menu_conv_id"] = None
-            if "menu_open" not in st.session_state:
-                st.session_state["menu_open"] = False
-
             for c in convs:
+                cid = c.get("id")
                 col1, col2 = st.columns([0.85, 0.15])
                 with col1:
-                    if st.button(c.get("title", "Untitled"), key=f"open_{c['id']}", use_container_width=True):
-                        loaded = load_conversation(c["id"])
+                    
+                    if st.button(c.get("title", "Untitled"), key=f"open_{cid}", use_container_width=True):
+                        loaded = load_conversation(cid)
                         if loaded:
                             st.session_state.current_conv_id = loaded["id"]
                             st.session_state.conversation_title = loaded.get("title", "")
                             st.session_state.messages = loaded.get("messages", [])
-                            safe_rerun()
+                            
+                            st.session_state[f"msg_count_{cid}"] = min(50, max(1, len(st.session_state.messages)))
 
                 with col2:
-                    if st.button("⋯", key=f"menu_{c['id']}"):
+                    if st.button("⋯", key=f"menu_{cid}"):
                         # ---------------- Toggle menu ----------------
-                        if st.session_state.get("menu_conv_id") == c["id"] and st.session_state.get("menu_open"):
+                        if st.session_state.get("menu_conv_id") == cid and st.session_state.get("menu_open"):
                             st.session_state["menu_open"] = False
                             st.session_state["menu_conv_id"] = None
                         else:
                             st.session_state["menu_open"] = True
-                            st.session_state["menu_conv_id"] = c["id"]
-                        safe_rerun()
+                            st.session_state["menu_conv_id"] = cid
 
-    
-                if st.session_state.get("menu_open") and st.session_state.get("menu_conv_id") == c["id"]:
-                    new_name = st.text_input("Rename conversation", value=c.get("title", ""), key=f"rename_input_{c['id']}")
+                
+                if st.session_state.get("menu_open") and st.session_state.get("menu_conv_id") == cid:
+                    new_name = st.text_input("Rename conversation", value=c.get("title", ""), key=f"rename_input_{cid}")
                     colr, cold = st.columns([0.7, 0.3])
                     with colr:
-                        if st.button("Rename", key=f"rename_btn_{c['id']}"):
+                        if st.button("Rename", key=f"rename_btn_{cid}"):
                             if new_name.strip():
-                                renamed = rename_conversation(c["id"], new_name.strip())
-                                if renamed and st.session_state.get("current_conv_id") == c["id"]:
+                                renamed = rename_conversation(cid, new_name.strip())
+                                if renamed and st.session_state.get("current_conv_id") == cid:
                                     st.session_state.conversation_title = renamed["title"]
                                 st.session_state["menu_open"] = False
                                 st.session_state["menu_conv_id"] = None
-                                safe_rerun()
                     with cold:
-                        if st.button("Delete", key=f"delete_btn_{c['id']}"):
-                            delete_conversation(c["id"])
-                            if st.session_state.get("current_conv_id") == c["id"]:
+                        if st.button("Delete", key=f"delete_btn_{cid}"):
+                            delete_conversation(cid)
+                            
+                            if st.session_state.get("current_conv_id") == cid:
                                 st.session_state.current_conv_id = None
                                 st.session_state.conversation_title = ""
                                 st.session_state.messages = []
+
                             st.session_state["menu_open"] = False
                             st.session_state["menu_conv_id"] = None
-                            safe_rerun()
 
             st.markdown("---")
 
@@ -259,8 +327,8 @@ def main():
                         for m in conv.get("messages", []):
                             role = m.get("role", "")
                             content = m.get("content", "")
-                            lines.append(f"{role.upper()}:\n{content}\n\n")
-                        text = "\n".join(lines)
+                            lines.append(f"{role.upper()}:{content}")
+                        text = "".join(lines)
                         fname = f"{conv.get('title','conv')[:30].replace(' ','_')}_{conv['id'][:8]}.txt"
                         st.download_button("Download TXT", data=text, file_name=fname, mime="text/plain")
 
@@ -271,15 +339,14 @@ def main():
                     st.session_state.current_conv_id = None
                     st.session_state.conversation_title = ""
                     st.session_state.messages = []
-                    safe_rerun()
 
         else:
             st.info("No saved conversations yet. Click 'New chat' to start one.")
 
+        st.markdown('<div class="sidebar-footer">Tip: Conversations are saved on disk in the <code>conversations/</code> folder.</div>', unsafe_allow_html=True)
 
     
     if "messages" not in st.session_state:
-        
         last_id = get_last_conversation_id()
         if last_id:
             conv = load_conversation(last_id)
@@ -287,49 +354,70 @@ def main():
                 st.session_state.current_conv_id = conv["id"]
                 st.session_state.conversation_title = conv.get("title", "")
                 st.session_state.messages = conv.get("messages", [])
+                st.session_state[f"msg_count_{conv['id']}"] = min(50, max(1, len(st.session_state.messages)))
             else:
                 new_conv = create_conversation("New chat")
                 st.session_state.current_conv_id = new_conv["id"]
                 st.session_state.conversation_title = new_conv["title"]
                 st.session_state.messages = new_conv["messages"]
+                st.session_state[f"msg_count_{new_conv['id']}"] = min(50, max(1, len(st.session_state.messages)))
         else:
             new_conv = create_conversation("New chat")
             st.session_state.current_conv_id = new_conv["id"]
             st.session_state.conversation_title = new_conv["title"]
             st.session_state.messages = new_conv["messages"]
-
-    
-    if "menu_conv_id" not in st.session_state:
-        st.session_state["menu_conv_id"] = None
-    if "menu_open" not in st.session_state:
-        st.session_state["menu_open"] = False
+            st.session_state[f"msg_count_{new_conv['id']}"] = min(50, max(1, len(st.session_state.messages)))
 
     
     st.subheader(st.session_state.get("conversation_title", "Conversation"))
 
     
-    for message in st.session_state.messages:
-        role = message.get("role", "user")
-        st.chat_message(role).markdown(message.get("content", ""))
+    cid = st.session_state.get("current_conv_id")
+    messages = st.session_state.get("messages", []) or []
+    if cid:
+        total = len(messages)
+        key_count = f"msg_count_{cid}"
+        if key_count not in st.session_state:
+            st.session_state[key_count] = min(50, max(1, total))
+        show_count = st.session_state[key_count]
+
+        
+        if total > show_count:
+            if st.button(f"Load earlier messages ({total - show_count} more)", key=f"load_more_{cid}"):
+                st.session_state[key_count] = min(total, show_count + 50)
+
+        
+        to_render = messages[-show_count:]
+        for message in to_render:
+            role = message.get("role", "user")
+            st.chat_message(role).markdown(message.get("content", ""))
+    else:
+        st.info("No conversation selected.")
 
     
     prompt = st.chat_input("Pass your prompt here")
     if prompt:
+        
         if not st.session_state.get("current_conv_id"):
             conv = create_conversation("New chat")
             st.session_state.current_conv_id = conv["id"]
             st.session_state.conversation_title = conv["title"]
             st.session_state.messages = conv["messages"]
 
+        
         user_msg = {"role": "user", "content": prompt}
         st.session_state.messages.append(user_msg)
+        
         st.chat_message("user").markdown(prompt)
 
+        
         cid = st.session_state["current_conv_id"]
         conv = load_conversation(cid) or {"id": cid, "title": st.session_state.get("conversation_title", ""), "created_at": datetime.utcnow().isoformat(), "messages": []}
         conv["messages"] = st.session_state.messages
         save_conversation(conv)
         st.session_state.conversation_title = conv.get("title", st.session_state.get("conversation_title", ""))
+        
+        st.session_state["convs_index"] = load_index()
 
         # ---------------- Wrapping custom prompt ----------------
         CUSTOM_PROMPT_TEMPLATE = """
@@ -374,6 +462,7 @@ def main():
             
             conv["title"] = st.session_state.get("conversation_title", conv.get("title", "Conversation"))
             save_conversation(conv)
+            st.session_state["convs_index"] = load_index()
 
             # ---------------- Source Documents ----------------
             with st.expander("Source documents"):
@@ -397,8 +486,8 @@ def main():
             elif "Connection refused" in msg or "Failed to establish a new connection" in msg:
                 st.error(
                     f"Cannot reach Ollama at {OLLAMA_BASE_URL}. "
-                    "Ensure Ollama is running and the model is pulled:\n\n"
-                    f"  ollama pull {OLLAMA_MODEL}\n"
+                    "Ensure Ollama is running and the model is pulled:"
+                    f"  ollama pull {OLLAMA_MODEL}"
                     "  ollama serve"
                 )
             else:
