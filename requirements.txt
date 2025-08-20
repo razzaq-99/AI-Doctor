@@ -1,0 +1,9 @@
+langchain
+langchain-community
+faiss-cpu
+langchain-huggingface
+langchain-ollama
+streamlit
+sentence-transformers
+uuid
+langchain-core
